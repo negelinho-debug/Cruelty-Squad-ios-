@@ -1,4 +1,4 @@
-name: Cruelty Squad iOS - v1.1 No URL Window
+name: Cruelty Squad iOS - v1.3 Auto Find APK
 
 on:
   workflow_dispatch:
@@ -17,11 +17,11 @@ jobs:
       GDRE_VERSION: "2.6.4"
       APP_NAME: "Cruelty Squad"
       BUNDLE_ID: "com.negel.crueltysquad"
-      WORK: "${{ github.workspace }}/_cruelty_ios_v1_1"
-      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_1/project"
-      APK: "${{ github.workspace }}/_cruelty_ios_v1_1/Cruelty-Squad.apk"
-      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_1/Cruelty-Squad-iOS.zip"
-      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.1-unsigned.ipa"
+      WORK: "${{ github.workspace }}/_cruelty_ios_v1_3"
+      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_3/project"
+      APK: "${{ github.workspace }}/_cruelty_ios_v1_3/Cruelty-Squad.apk"
+      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_3/Cruelty-Squad-iOS.zip"
+      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.3-unsigned.ipa"
 
     steps:
       - name: Checkout
@@ -34,104 +34,103 @@ jobs:
           rm -rf "$WORK"
           mkdir -p "$WORK" "$PROJECT" "$WORK/logs" "$WORK/icons"
 
-      - name: Get Cruelty Squad APK automatically
+      - name: Find Cruelty Squad APK automatically
         shell: bash
         env:
-          APKWARD_PAGE: "https://apkaward.com/cruelty-squad"
+          GH_TOKEN: "${{ github.token }}"
         run: |
           set -euo pipefail
 
-          echo "No URL window. Source page: $APKWARD_PAGE"
+          echo "=== LOOK FOR APK IN CHECKED-OUT REPOSITORY ==="
+          FOUND="$(find "$GITHUB_WORKSPACE" -type f -iname '*.apk' \
+            ! -path "$WORK/*" -print -quit || true)"
 
-          FOUND="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -iname '*.apk' ! -path "$WORK/*" | head -n 1 || true)"
           if [ -n "$FOUND" ]; then
             echo "Found APK in repository: $FOUND"
+
+            # If Git LFS was used, make sure checkout gave us the real binary
+            # and not a tiny LFS pointer text file.
+            if head -c 200 "$FOUND" 2>/dev/null | grep -q 'git-lfs.github.com/spec'; then
+              echo "APK is a Git LFS pointer. Pulling LFS content..."
+              git lfs install --local || true
+              git lfs pull
+            fi
+
             cp "$FOUND" "$APK"
           else
-            PAGE="$WORK/apkaward.html"
-            curl --fail --location --retry 4 --retry-delay 3 \
-              --connect-timeout 30 --max-time 90 \
-              -A "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1" \
-              "$APKWARD_PAGE" -o "$PAGE"
+            echo "No APK file in repository checkout."
+            echo "=== LOOK FOR APK IN GITHUB RELEASES ==="
 
-            python3 - "$APKWARD_PAGE" "$PAGE" > "$WORK/candidates.txt" <<'PYCODE'
-          import html, re, sys
-          from urllib.parse import urljoin
-          base, path = sys.argv[1], sys.argv[2]
-          data = html.unescape(open(path, 'r', errors='ignore').read())
-          pats = [
-              r'href=["\']([^"\']+)["\']',
-              r'data-url=["\']([^"\']+)["\']',
-              r'data-href=["\']([^"\']+)["\']',
-              r'https?://[^\s"\'<>]+'
-          ]
-          seen=set()
-          for pat in pats:
-              for m in re.finditer(pat, data, re.I):
-                  u = m.group(1) if m.lastindex else m.group(0)
-                  u = urljoin(base, u)
-                  low=u.lower()
-                  if any(k in low for k in ('.apk','download','cruelty')) and u not in seen:
-                      seen.add(u); print(u)
-          PYCODE
+            mkdir -p "$WORK/release-apk"
 
-            echo "Candidates:"
-            sed -n '1,80p' "$WORK/candidates.txt" || true
+            # Try latest release first.
+            if gh release download \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern '*.apk' \
+              --dir "$WORK/release-apk" 2>/dev/null; then
+              :
+            else
+              echo "Latest release had no APK. Searching all releases..."
 
-            OK=0
-            while IFS= read -r URL; do
-              [ -n "$URL" ] || continue
-              TMP="$WORK/candidate.bin"
-              rm -f "$TMP"
-              echo "Trying: $URL"
-              if ! curl --location --retry 2 --retry-delay 2 \
-                --connect-timeout 20 --max-time 240 \
-                -A "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1" \
-                -e "$APKWARD_PAGE" "$URL" -o "$TMP"; then
-                continue
-              fi
+              TAGS="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' || true)"
+              for TAG in $TAGS; do
+                rm -rf "$WORK/release-apk"
+                mkdir -p "$WORK/release-apk"
 
-              if python3 - "$TMP" <<'PYCODE'
-          import sys, zipfile
-          p=sys.argv[1]
-          try:
-              with zipfile.ZipFile(p) as z:
-                  n=set(z.namelist())
-                  ok='assets/project.binary' in n and 'lib/arm64-v8a/libgodot_android.so' in n
-                  raise SystemExit(0 if ok else 1)
-          except Exception:
-              raise SystemExit(1)
-          PYCODE
-              then
-                cp "$TMP" "$APK"
-                OK=1
-                break
-              fi
-            done < "$WORK/candidates.txt"
+                if gh release download "$TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --pattern '*.apk' \
+                  --dir "$WORK/release-apk" 2>/dev/null; then
+                  FOUND_RELEASE="$(find "$WORK/release-apk" -maxdepth 1 -type f -iname '*.apk' -print -quit || true)"
+                  if [ -n "$FOUND_RELEASE" ]; then
+                    echo "Found APK in release tag: $TAG"
+                    break
+                  fi
+                fi
+              done
+            fi
 
-            if [ "$OK" -ne 1 ]; then
-              echo "::error::APKWard did not expose a usable direct APK link to GitHub Actions."
-              echo "::error::This is a site download-link issue, not a Godot/iOS build error."
-              exit 1
+            FOUND_RELEASE="$(find "$WORK/release-apk" -maxdepth 1 -type f -iname '*.apk' -print -quit || true)"
+            if [ -n "$FOUND_RELEASE" ]; then
+              cp "$FOUND_RELEASE" "$APK"
+              echo "Downloaded APK from release: $FOUND_RELEASE"
             fi
           fi
 
-          echo "APK size:"
+          if [ ! -f "$APK" ]; then
+            echo "::error::Could not find any APK in the repository or GitHub Releases."
+            exit 1
+          fi
+
+          echo "APK candidate:"
           ls -lh "$APK"
 
           python3 - <<'PYCODE'
           import os, sys, zipfile
-          apk=os.environ['APK']
-          with zipfile.ZipFile(apk) as z:
-              names=set(z.namelist())
-              required={'assets/project.binary','lib/arm64-v8a/libgodot_android.so'}
-              missing=sorted(required-names)
-              if missing:
-                  print('ERROR: wrong APK:', *missing, sep='\n - ')
-                  sys.exit(2)
-              print('APK ZIP OK')
-              print('GDScript bytecode files:', sum(n.endswith('.gdc') for n in names))
-              print('Scenes:', sum(n.endswith('.tscn') or n.endswith('.scn') for n in names))
+          apk = os.environ["APK"]
+
+          try:
+              with zipfile.ZipFile(apk) as z:
+                  names = set(z.namelist())
+                  required = {
+                      "assets/project.binary",
+                      "lib/arm64-v8a/libgodot_android.so",
+                  }
+                  missing = sorted(required - names)
+
+                  if missing:
+                      print("ERROR: APK was found, but it is not the expected Cruelty Squad Godot port.")
+                      print("Missing:", *missing, sep="\n - ")
+                      sys.exit(2)
+
+                  print("APK ZIP OK")
+                  print("project.binary: YES")
+                  print("ARM64 Godot: YES")
+                  print("GDScript bytecode files:", sum(n.endswith(".gdc") for n in names))
+                  print("Scenes:", sum(n.endswith(".tscn") or n.endswith(".scn") for n in names))
+          except zipfile.BadZipFile:
+              print("ERROR: found .apk is not a valid APK/ZIP.")
+              sys.exit(3)
           PYCODE
 
       - name: Confirm Godot version and mobile content
@@ -615,7 +614,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.1-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.3-Diagnostics"
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
 
@@ -650,12 +649,12 @@ jobs:
           tail -n 500 "$DIAG/important-errors.txt" || true
 
       - name: Upload unsigned IPA
-        if: hashFiles('Cruelty-Squad-iOS-v1.1-unsigned.ipa') != ''
+        if: hashFiles('Cruelty-Squad-iOS-v1.3-unsigned.ipa') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.1-unsigned-IPA
+          name: Cruelty-Squad-iOS-v1.3-unsigned-IPA
           path: |
-            Cruelty-Squad-iOS-v1.1-unsigned.ipa
+            Cruelty-Squad-iOS-v1.3-unsigned.ipa
             Cruelty-Squad-original-icon.png
           compression-level: 0
           if-no-files-found: error
@@ -664,8 +663,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.1-Diagnostics
-          path: Cruelty-Squad-iOS-v1.1-Diagnostics
+          name: Cruelty-Squad-iOS-v1.3-Diagnostics
+          path: Cruelty-Squad-iOS-v1.3-Diagnostics
           compression-level: 6
           if-no-files-found: warn
 
@@ -674,9 +673,9 @@ jobs:
         shell: bash
         run: |
           if [ -f "$IPA" ]; then
-            echo "SUCCESS: Cruelty-Squad-iOS-v1.1-unsigned.ipa was created."
+            echo "SUCCESS: Cruelty-Squad-iOS-v1.3-unsigned.ipa was created."
             exit 0
           fi
 
-          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.1-Diagnostics and send it here."
+          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.3-Diagnostics and send it here."
           exit 1
