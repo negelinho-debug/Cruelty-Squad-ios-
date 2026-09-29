@@ -1,0 +1,641 @@
+name: Cruelty Squad iOS - v1 Godot 3.5.3
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct URL to Cruelty Squad 2.5 APK. Leave empty only if an APK is already in the repo."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Recover Godot project and build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      GODOT_VERSION: "3.5.3"
+      GDRE_VERSION: "2.6.4"
+      APP_NAME: "Cruelty Squad"
+      BUNDLE_ID: "com.negel.crueltysquad"
+      WORK: "${{ github.workspace }}/_cruelty_ios_v1"
+      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1/project"
+      APK: "${{ github.workspace }}/_cruelty_ios_v1/Cruelty-Squad.apk"
+      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1/Cruelty-Squad-iOS.zip"
+      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1-unsigned.ipa"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$WORK"
+          mkdir -p "$WORK" "$PROJECT" "$WORK/logs" "$WORK/icons"
+
+      - name: Get Cruelty Squad APK
+        shell: bash
+        env:
+          APK_URL: "${{ inputs.apk_url }}"
+        run: |
+          set -euo pipefail
+
+          if [ -n "${APK_URL}" ]; then
+            echo "Downloading APK from supplied URL..."
+            curl --fail --location --retry 4 --retry-delay 3 \
+              --connect-timeout 30 \
+              -A "Mozilla/5.0" \
+              "${APK_URL}" \
+              -o "$APK"
+          else
+            echo "No URL supplied. Looking for an APK already in the repository..."
+            FOUND="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -type f -iname '*.apk' \
+              ! -path "$WORK/*" | head -n 1 || true)"
+            if [ -z "$FOUND" ]; then
+              echo "::error::No APK found. Run the workflow again and paste a DIRECT APK download URL into apk_url."
+              exit 1
+            fi
+            cp "$FOUND" "$APK"
+          fi
+
+          echo "APK size:"
+          ls -lh "$APK"
+
+          python3 - <<'PY'
+          import os, sys, zipfile
+          apk = os.environ["APK"]
+          try:
+              with zipfile.ZipFile(apk) as z:
+                  names = set(z.namelist())
+                  required = {
+                      "assets/project.binary",
+                      "lib/arm64-v8a/libgodot_android.so",
+                  }
+                  missing = sorted(required - names)
+                  if missing:
+                      print("ERROR: this file does not look like the Cruelty Squad Godot APK.")
+                      print("Missing:", *missing, sep="\n - ")
+                      sys.exit(2)
+
+                  print("APK ZIP OK")
+                  print("Has project.binary:", "assets/project.binary" in names)
+                  print("Has ARM64 Godot:", "lib/arm64-v8a/libgodot_android.so" in names)
+                  print("GDScript bytecode files:", sum(n.endswith(".gdc") for n in names))
+                  print("Scenes:", sum(n.endswith(".tscn") or n.endswith(".scn") for n in names))
+          except zipfile.BadZipFile:
+              print("ERROR: downloaded file is not an APK/ZIP. The URL probably points to a web page, not the APK itself.")
+              sys.exit(3)
+          PY
+
+      - name: Confirm Godot version and mobile content
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -p "$APK" lib/arm64-v8a/libgodot_android.so > "$WORK/libgodot_android.so"
+          VERSION="$(strings "$WORK/libgodot_android.so" | grep -Eo '3\.5\.[0-9]+\.stable\.official' | head -n 1 || true)"
+          echo "Detected Godot: ${VERSION:-unknown}" | tee "$WORK/logs/apk-summary.txt"
+
+          if [ -n "$VERSION" ] && [[ "$VERSION" != 3.5.3* ]]; then
+            echo "::warning::APK Godot version is $VERSION, workflow is prepared for Godot 3.5.3."
+          fi
+
+          {
+            echo
+            echo "ARM libraries:"
+            unzip -Z1 "$APK" | grep '^lib/' | sort || true
+            echo
+            echo "Touch controls:"
+            unzip -Z1 "$APK" | grep -Ei '^assets/(touch|joystick|VirtualAnalog)' | head -n 200 || true
+            echo
+            echo "Steam/GDNative:"
+            unzip -Z1 "$APK" | grep -Ei 'godotsteam|steamstub|Steam\.(gd|gdc|tscn)' | head -n 200 || true
+          } >> "$WORK/logs/apk-summary.txt"
+
+      - name: Extract original Android icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ICON=""
+          for CANDIDATE in \
+            res/mipmap-xxxhdpi-v4/icon.png \
+            res/mipmap-xxhdpi-v4/icon.png \
+            res/mipmap-xhdpi-v4/icon.png \
+            res/mipmap-hdpi-v4/icon.png \
+            res/mipmap-mdpi-v4/icon.png \
+            res/mipmap/icon.png
+          do
+            if unzip -Z1 "$APK" | grep -Fxq "$CANDIDATE"; then
+              unzip -p "$APK" "$CANDIDATE" > "$WORK/icons/original.png"
+              ICON="$CANDIDATE"
+              break
+            fi
+          done
+
+          if [ -z "$ICON" ]; then
+            echo "::error::Original APK icon was not found."
+            exit 1
+          fi
+
+          echo "Using original icon: $ICON"
+          file "$WORK/icons/original.png"
+
+          cp "$WORK/icons/original.png" "$WORK/icons/icon-source.png"
+          sips -s format png -z 120 120   "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-120.png"  >/dev/null
+          sips -s format png -z 76 76     "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-76.png"   >/dev/null
+          sips -s format png -z 1024 1024 "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-1024.png" >/dev/null
+          sips -s format png -z 180 180 "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-180.png" >/dev/null
+          sips -s format png -z 152 152 "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-152.png" >/dev/null
+          sips -s format png -z 167 167 "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-167.png" >/dev/null
+          sips -s format png -z 40 40   "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-40.png"  >/dev/null
+          sips -s format png -z 80 80   "$WORK/icons/icon-source.png" --out "$WORK/icons/icon-80.png"  >/dev/null
+
+      - name: Download Godot RE Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://github.com/GDRETools/gdsdecomp/releases/download/v${GDRE_VERSION}/GDRE_tools-v${GDRE_VERSION}-macos.zip"
+          curl --fail --location --retry 4 "$URL" -o "$WORK/gdre.zip"
+          mkdir -p "$WORK/gdre"
+          ditto -x -k "$WORK/gdre.zip" "$WORK/gdre"
+          xattr -dr com.apple.quarantine "$WORK/gdre" 2>/dev/null || true
+
+          echo "GDRE archive contents:"
+          find "$WORK/gdre" -maxdepth 5 -type f | head -n 80
+
+          GDRE="$(
+            find "$WORK/gdre" -type f \( -name 'gdre_tools' -o -name 'GDRE Tools' -o -name 'GDRE_tools' \) \
+              | head -n 1
+          )"
+
+          if [ -z "$GDRE" ]; then
+            GDRE="$(find "$WORK/gdre" -path '*/Contents/MacOS/*' -type f | head -n 1 || true)"
+          fi
+
+          if [ -z "$GDRE" ]; then
+            echo "::error::Could not locate GDRE Tools executable."
+            exit 1
+          fi
+
+          chmod +x "$GDRE"
+          echo "GDRE=$GDRE" >> "$GITHUB_ENV"
+          "$GDRE" --version 2>&1 | tee "$WORK/logs/gdre-version.txt" || true
+
+      - name: Recover the Godot project from APK
+        shell: bash
+        run: |
+          set +e
+
+          "$GDRE" \
+            --headless \
+            --recover="$APK" \
+            --output-dir="$PROJECT" \
+            --ignore-checksum-errors \
+            2>&1 | tee "$WORK/logs/gdre-recovery.log"
+
+          RC=${PIPESTATUS[0]}
+          echo "GDRE_EXIT_CODE=$RC" | tee -a "$WORK/logs/gdre-recovery.log"
+
+          if [ ! -f "$PROJECT/project.godot" ]; then
+            FOUND="$(find "$PROJECT" -type f -name project.godot -print -quit || true)"
+            if [ -n "$FOUND" ]; then
+              REAL_PROJECT="$(dirname "$FOUND")"
+              echo "Recovered project is nested at: $REAL_PROJECT"
+              echo "PROJECT=$REAL_PROJECT" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          exit 0
+
+      - name: Validate recovered project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$PROJECT/project.godot" ]; then
+            echo "::error::GDRE did not produce project.godot."
+            echo "Top recovered files:"
+            find "$WORK/project" -maxdepth 3 -type f | head -n 200 || true
+            exit 1
+          fi
+
+          echo "Recovered project: $PROJECT"
+          echo "GDScript source count: $(find "$PROJECT" -type f -name '*.gd' | wc -l | tr -d ' ')"
+          echo "Scene count: $(find "$PROJECT" -type f \( -name '*.tscn' -o -name '*.scn' \) | wc -l | tr -d ' ')"
+
+          grep -nE 'application/config/name|application/run/main_scene|autoload/|rendering/quality/driver|display/window/handheld/orientation' \
+            "$PROJECT/project.godot" \
+            | tee "$WORK/logs/project-important-settings.txt" || true
+
+      - name: Prepare recovered project for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$PROJECT/ios_icon"
+
+          cp "$WORK/icons/original.png"  "$PROJECT/ios_icon/original.png"
+          cp "$WORK/icons/icon-120.png"  "$PROJECT/ios_icon/icon-120.png"
+          cp "$WORK/icons/icon-76.png"   "$PROJECT/ios_icon/icon-76.png"
+          cp "$WORK/icons/icon-1024.png" "$PROJECT/ios_icon/icon-1024.png"
+          cp "$WORK/icons/icon-180.png"  "$PROJECT/ios_icon/icon-180.png"
+          cp "$WORK/icons/icon-152.png"  "$PROJECT/ios_icon/icon-152.png"
+          cp "$WORK/icons/icon-167.png"  "$PROJECT/ios_icon/icon-167.png"
+          cp "$WORK/icons/icon-40.png"   "$PROJECT/ios_icon/icon-40.png"
+          cp "$WORK/icons/icon-80.png"   "$PROJECT/ios_icon/icon-80.png"
+
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          project = pathlib.Path(os.environ["PROJECT"]) / "project.godot"
+          text = project.read_text(errors="replace")
+
+          text = re.sub(
+              r'(?ms)(^\[editor_plugins\]\s*.*?)(?=^\[|\Z)',
+              '[editor_plugins]\nenabled=PoolStringArray( )\n\n',
+              text
+          )
+
+          if 'application/config/icon=' in text:
+              text = re.sub(
+                  r'(?m)^application/config/icon=.*$',
+                  'application/config/icon="res://ios_icon/original.png"',
+                  text
+              )
+          else:
+              m = re.search(r'(?m)^\[application\]\s*$', text)
+              if m:
+                  insert = m.end()
+                  text = text[:insert] + '\napplication/config/icon="res://ios_icon/original.png"' + text[insert:]
+
+          project.write_text(text)
+          PY
+
+          find "$PROJECT" -type f \( -name '*.apk' -o -name '*.aar' \) -delete || true
+          find "$PROJECT" -type f -name '*.so' \
+            ! -path '*/addons/godotsteam/*' \
+            -delete || true
+
+          echo "Steam references kept for runtime compatibility/stub detection:"
+          grep -RniE 'Steam|godotsteam|steamstub' "$PROJECT" \
+            --include='*.gd' --include='*.gdnlib' --include='*.gdns' \
+            | head -n 250 \
+            | tee "$WORK/logs/steam-references.txt" || true
+
+      - name: Create iOS export preset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "$PROJECT/export_presets.cfg" <<'CFG'
+          [preset.0]
+
+          name="iOS"
+          platform="iOS"
+          runnable=true
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path=""
+          patch_list=PoolStringArray( )
+          script_export_mode=1
+          script_encryption_key=""
+
+          [preset.0.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          application/app_store_team_id="AAAAAAAAAA"
+          application/provisioning_profile_uuid_debug=""
+          application/code_sign_identity_debug="iPhone Developer"
+          application/export_method_debug=1
+          application/provisioning_profile_uuid_release=""
+          application/code_sign_identity_release="iPhone Distribution"
+          application/export_method_release=0
+          application/name="Cruelty Squad"
+          application/info="Cruelty Squad"
+          application/identifier="com.negel.crueltysquad"
+          application/signature="CRSQ"
+          application/short_version="2.5"
+          application/version="2.5"
+          application/copyright=""
+          capabilities/arkit=false
+          capabilities/camera=false
+          capabilities/access_wifi=false
+          capabilities/game_center=false
+          capabilities/in_app_purchases=false
+          capabilities/push_notifications=false
+          user_data/accessible_from_files_app=false
+          user_data/accessible_from_itunes_sharing=false
+          privacy/camera_usage_description=""
+          privacy/microphone_usage_description=""
+          privacy/photolibrary_usage_description=""
+          orientation/portrait=false
+          orientation/landscape_left=true
+          orientation/landscape_right=true
+          orientation/portrait_upside_down=false
+          required_icons/iphone_120x120="res://ios_icon/icon-120.png"
+          required_icons/ipad_76x76="res://ios_icon/icon-76.png"
+          required_icons/app_store_1024x1024="res://ios_icon/icon-1024.png"
+          optional_icons/iphone_180x180="res://ios_icon/icon-180.png"
+          optional_icons/ipad_152x152="res://ios_icon/icon-152.png"
+          optional_icons/ipad_167x167="res://ios_icon/icon-167.png"
+          optional_icons/spotlight_40x40="res://ios_icon/icon-40.png"
+          optional_icons/spotlight_80x80="res://ios_icon/icon-80.png"
+          storyboard/use_launch_screen_storyboard=false
+          storyboard/image_scale_mode=0
+          storyboard/custom_image@2x=""
+          storyboard/custom_image@3x=""
+          storyboard/use_custom_bg_color=false
+          storyboard/custom_bg_color=Color( 0, 0, 0, 1 )
+          landscape_launch_screens/iphone_2436x1125=""
+          landscape_launch_screens/iphone_2208x1242=""
+          landscape_launch_screens/ipad_1024x768=""
+          landscape_launch_screens/ipad_2048x1536=""
+          portrait_launch_screens/iphone_640x960=""
+          portrait_launch_screens/iphone_640x1136=""
+          portrait_launch_screens/iphone_750x1334=""
+          portrait_launch_screens/iphone_1125x2436=""
+          portrait_launch_screens/ipad_768x1024=""
+          portrait_launch_screens/ipad_1536x2048=""
+          portrait_launch_screens/iphone_1242x2208=""
+          architectures/armv7=false
+          architectures/arm64=true
+          CFG
+
+          sed -n '1,220p' "$PROJECT/export_presets.cfg" \
+            | tee "$WORK/logs/export-preset.txt"
+
+      - name: Download Godot 3.5.3 and iOS export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GODOT_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_osx.universal.zip"
+          TEMPLATE_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+
+          curl --fail --location --retry 4 "$GODOT_URL" -o "$WORK/godot.zip"
+          curl --fail --location --retry 4 "$TEMPLATE_URL" -o "$WORK/templates.tpz"
+
+          mkdir -p "$WORK/godot" "$WORK/templates-unpack"
+          ditto -x -k "$WORK/godot.zip" "$WORK/godot"
+          unzip -q "$WORK/templates.tpz" -d "$WORK/templates-unpack"
+
+          GODOT="$(find "$WORK/godot" -path '*/Godot.app/Contents/MacOS/Godot' -type f | head -n 1)"
+          if [ -z "$GODOT" ]; then
+            echo "::error::Godot executable not found."
+            exit 1
+          fi
+
+          chmod +x "$GODOT"
+          xattr -dr com.apple.quarantine "$WORK/godot" 2>/dev/null || true
+          echo "GODOT=$GODOT" >> "$GITHUB_ENV"
+
+          TEMPLATE_DIR="$HOME/Library/Application Support/Godot/templates/${GODOT_VERSION}.stable"
+          rm -rf "$TEMPLATE_DIR"
+          mkdir -p "$TEMPLATE_DIR"
+
+          if [ -d "$WORK/templates-unpack/templates" ]; then
+            cp -R "$WORK/templates-unpack/templates/." "$TEMPLATE_DIR/"
+          else
+            cp -R "$WORK/templates-unpack/." "$TEMPLATE_DIR/"
+          fi
+
+          echo "Godot:"
+          "$GODOT" --version
+          echo "iOS template candidates:"
+          find "$TEMPLATE_DIR" -maxdepth 2 -type f | grep -Ei 'iphone|ios' | head -n 80 || true
+
+      - name: Import recovered project
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+
+          "$GODOT" \
+            --path "$PROJECT" \
+            --no-window \
+            --editor \
+            --quit \
+            2>&1 | tee "$WORK/logs/godot-import.log"
+
+          RC=${PIPESTATUS[0]}
+          echo "GODOT_IMPORT_EXIT_CODE=$RC" | tee -a "$WORK/logs/godot-import.log"
+          exit "$RC"
+
+      - name: Export Godot iOS Xcode project
+        id: godot_export
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          rm -f "$IOS_ZIP"
+
+          "$GODOT" \
+            --path "$PROJECT" \
+            --no-window \
+            --export "iOS" "$IOS_ZIP" \
+            2>&1 | tee "$WORK/logs/godot-ios-export.log"
+
+          RC=${PIPESTATUS[0]}
+          echo "GODOT_EXPORT_EXIT_CODE=$RC" | tee -a "$WORK/logs/godot-ios-export.log"
+
+          if [ -f "$IOS_ZIP" ]; then
+            echo "Godot produced iOS ZIP:"
+            ls -lh "$IOS_ZIP"
+          else
+            echo "::warning::Godot did not produce the iOS ZIP."
+          fi
+
+          exit "$RC"
+
+      - name: Inspect Godot export
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$IOS_ZIP" ]; then
+            echo "::error::No iOS export ZIP exists. Check godot-ios-export.log."
+            exit 1
+          fi
+
+          rm -rf "$WORK/ios-export"
+          mkdir -p "$WORK/ios-export"
+          ditto -x -k "$IOS_ZIP" "$WORK/ios-export"
+
+          XCPROJ="$(find "$WORK/ios-export" -type d -name '*.xcodeproj' | head -n 1 || true)"
+          if [ -z "$XCPROJ" ]; then
+            echo "::error::Godot ZIP has no .xcodeproj."
+            find "$WORK/ios-export" -maxdepth 4 -type f | head -n 250
+            exit 1
+          fi
+
+          echo "XCPROJ=$XCPROJ" >> "$GITHUB_ENV"
+          echo "Xcode project: $XCPROJ"
+
+          xcodebuild -project "$XCPROJ" -list -json \
+            | tee "$WORK/logs/xcode-project-list.json" || true
+
+      - name: Build unsigned iOS app
+        id: xcode_build
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+
+          INFO="$(xcodebuild -project "$XCPROJ" -list -json 2>/dev/null)"
+          SCHEME="$(printf '%s' "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); a=d.get("project",{}).get("schemes",[]); print(a[0] if a else "")' 2>/dev/null)"
+          TARGET="$(printf '%s' "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); a=d.get("project",{}).get("targets",[]); print(a[0] if a else "")' 2>/dev/null)"
+
+          echo "Scheme: ${SCHEME:-<none>}"
+          echo "Target: ${TARGET:-<none>}"
+
+          if [ -n "$SCHEME" ]; then
+            SELECTOR=(-scheme "$SCHEME")
+          elif [ -n "$TARGET" ]; then
+            SELECTOR=(-target "$TARGET")
+          else
+            echo "::error::Could not determine Xcode scheme or target."
+            exit 2
+          fi
+
+          rm -rf "$WORK/products" "$WORK/DerivedData"
+          mkdir -p "$WORK/products"
+
+          xcodebuild \
+            -project "$XCPROJ" \
+            "${SELECTOR[@]}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$WORK/DerivedData" \
+            CONFIGURATION_BUILD_DIR="$WORK/products" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_BITCODE=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+            build \
+            2>&1 | tee "$WORK/logs/xcodebuild.log"
+
+          RC=${PIPESTATUS[0]}
+          echo "XCODEBUILD_EXIT_CODE=$RC" | tee -a "$WORK/logs/xcodebuild.log"
+          exit "$RC"
+
+      - name: Package unsigned IPA
+        id: package
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          APP="$(find "$WORK/products" "$WORK/DerivedData/Build/Products" \
+            -type d -name '*.app' \
+            ! -path '*Simulator*' \
+            | head -n 1 || true)"
+
+          if [ -z "$APP" ]; then
+            echo "::error::No device .app was produced."
+            exit 1
+          fi
+
+          echo "APP=$APP"
+          du -sh "$APP"
+
+          rm -rf "$WORK/Payload"
+          mkdir -p "$WORK/Payload"
+          ditto "$APP" "$WORK/Payload/$(basename "$APP")"
+
+          rm -f "$IPA"
+          (
+            cd "$WORK"
+            zip -qry "$IPA" Payload
+          )
+
+          echo "Unsigned IPA:"
+          ls -lh "$IPA"
+
+          cp "$WORK/icons/original.png" "$GITHUB_WORKSPACE/Cruelty-Squad-original-icon.png"
+
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1-Diagnostics"
+          rm -rf "$DIAG"
+          mkdir -p "$DIAG"
+
+          cp -R "$WORK/logs/." "$DIAG/" 2>/dev/null || true
+          cp "$PROJECT/project.godot" "$DIAG/project.godot" 2>/dev/null || true
+          cp "$PROJECT/export_presets.cfg" "$DIAG/export_presets.cfg" 2>/dev/null || true
+          cp "$WORK/icons/original.png" "$DIAG/original-apk-icon.png" 2>/dev/null || true
+
+          {
+            echo "=== APK ==="
+            ls -lh "$APK" 2>/dev/null || true
+            echo
+            echo "=== GODOT ==="
+            "$GODOT" --version 2>/dev/null || true
+            echo
+            echo "=== PROJECT ==="
+            echo "$PROJECT"
+            echo
+            echo "=== XCODE ==="
+            xcodebuild -version 2>/dev/null || true
+            echo
+            echo "=== IPA ==="
+            ls -lh "$IPA" 2>/dev/null || true
+          } > "$DIAG/summary.txt"
+
+          grep -RniE \
+            'error|failed|failure|parse error|invalid|missing|not found|gdnative|steam|xcodebuild: error|fatal' \
+            "$DIAG" \
+            > "$DIAG/important-errors.txt" \
+            2>/dev/null || true
+
+          tail -n 500 "$DIAG/important-errors.txt" || true
+
+      - name: Upload unsigned IPA
+        if: hashFiles('Cruelty-Squad-iOS-v1-unsigned.ipa') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cruelty-Squad-iOS-v1-unsigned-IPA
+          path: |
+            Cruelty-Squad-iOS-v1-unsigned.ipa
+            Cruelty-Squad-original-icon.png
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cruelty-Squad-iOS-v1-Diagnostics
+          path: Cruelty-Squad-iOS-v1-Diagnostics
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Final result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$IPA" ]; then
+            echo "SUCCESS: Cruelty-Squad-iOS-v1-unsigned.ipa was created."
+            exit 0
+          fi
+
+          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1-Diagnostics and send it here."
+          exit 1
