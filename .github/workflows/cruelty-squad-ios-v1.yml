@@ -1,4 +1,4 @@
-name: Cruelty Squad iOS - v1.7 PVRTC Fix
+name: Cruelty Squad iOS - v1.9 GLES3 Angle Fix
 
 on:
   workflow_dispatch:
@@ -17,12 +17,12 @@ jobs:
       GDRE_VERSION: "2.6.4"
       APP_NAME: "Cruelty Squad"
       BUNDLE_ID: "com.negel.crueltysquad"
-      WORK: "${{ github.workspace }}/_cruelty_ios_v1_7"
-      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_7/project"
-      APK: "${{ github.workspace }}/_cruelty_ios_v1_7/Cruelty-Squad.apk"
-      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_7/ios-out"
-      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_7/ios-out/CrueltySquad.zip"
-      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.7-unsigned.ipa"
+      WORK: "${{ github.workspace }}/_cruelty_ios_v1_9"
+      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_9/project"
+      APK: "${{ github.workspace }}/_cruelty_ios_v1_9/Cruelty-Squad.apk"
+      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_9/ios-out"
+      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_9/ios-out/CrueltySquad.zip"
+      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.9-unsigned.ipa"
 
     steps:
       - name: Checkout
@@ -334,11 +334,50 @@ jobs:
           else:
               text += '\n\n[rendering]\n' + pvrtc_line + '\n'
 
+          # v1.8: iOS GLES2 forward-movement / exploding-triangle fix.
+          #
+          # The symptom on-device is geometry stretching into giant black polygons
+          # only while moving forward. Godot 3.x had several iOS GLES2 issues around
+          # half-float vertex data / mesh compression and hardware skinning.
+          # Force the safest path for iPhone here:
+          ios_render_settings = {
+              # v1.9: move the iPhone build off the GLES2 path entirely.
+              # The remaining artifact is angle/movement dependent giant black geometry.
+              # GLES3 uses a different vertex/render path on iOS and avoids the GLES2
+              # half-float/split-stream path that has already been problematic.
+              'quality/driver/driver_name': '"GLES3"',
+              'quality/driver/fallback_to_gles2': 'false',
+
+              # Keep the conservative mesh settings from v1.8 too.
+              'gles2/compatibility/disable_half_float': 'true',
+              'gles2/compatibility/disable_half_float.iOS': 'true',
+              'misc/mesh_storage/split_stream': 'false',
+              'quality/skinning/force_software_skinning': 'true',
+              'threads/thread_safe_bvh': 'true',
+              'threads/thread_model': '1',
+          }
+
+          # Ensure there is exactly one [rendering] section.
+          m_render = re.search(r'(?m)^\[rendering\]\s*$', text)
+          if not m_render:
+              text += '\n\n[rendering]\n'
+              m_render = re.search(r'(?m)^\[rendering\]\s*$', text)
+
+          for key, value in ios_render_settings.items():
+              pat = r'(?m)^' + re.escape(key) + r'=.*$'
+              line = key + '=' + value
+              if re.search(pat, text):
+                  text = re.sub(pat, line, text)
+              else:
+                  pos = m_render.end()
+                  text = text[:pos] + '\n' + line + text[pos:]
+                  m_render = re.search(r'(?m)^\[rendering\]\s*$', text)
+
           project.write_text(text)
           PY
 
-          echo "===== iOS TEXTURE COMPRESSION SETTINGS ====="
-          grep -nE 'quality/driver/driver_name|vram_compression/import_(etc|etc2|pvrtc|s3tc)'             "$PROJECT/project.godot"             | tee "$WORK/logs/ios-texture-settings.txt" || true
+          echo "===== iOS RENDERER COMPATIBILITY SETTINGS ====="
+          grep -nE 'quality/driver/driver_name|quality/driver/fallback_to_gles2|vram_compression/import_(etc|etc2|pvrtc|s3tc)|gles2/compatibility/disable_half_float|misc/mesh_storage/split_stream|quality/skinning/force_software_skinning|threads/thread_safe_bvh|threads/thread_model'             "$PROJECT/project.godot"             | tee "$WORK/logs/ios-renderer-settings-v1.9.txt" || true
 
           # Recovered Android imports only contain Android-friendly texture variants.
           # Delete the generated cache so Godot regenerates textures with PVRTC.
@@ -349,6 +388,22 @@ jobs:
           find "$PROJECT" -type f -name '*.so' \
             ! -path '*/addons/godotsteam/*' \
             -delete || true
+
+          cat > "$PROJECT/override.cfg" <<'OVERRIDE'
+          [rendering]
+
+          quality/driver/driver_name="GLES3"
+          quality/driver/fallback_to_gles2=false
+          gles2/compatibility/disable_half_float=true
+          gles2/compatibility/disable_half_float.iOS=true
+          misc/mesh_storage/split_stream=false
+          quality/skinning/force_software_skinning=true
+          threads/thread_safe_bvh=true
+          threads/thread_model=1
+          OVERRIDE
+
+          echo "===== override.cfg ====="
+          cat "$PROJECT/override.cfg" | tee "$WORK/logs/override-v1.9.txt"
 
           echo "Steam references kept for runtime compatibility/stub detection:"
           grep -RniE 'Steam|godotsteam|steamstub' "$PROJECT" \
@@ -494,6 +549,44 @@ jobs:
           sudo xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
 
           mkdir -p "$IOS_OUT"
+
+      - name: Auto-detect known Godot iOS render blockers
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT="$WORK/logs/auto-triage-v1.9.txt"
+          : > "$REPORT"
+
+          echo "Cruelty Squad iOS v1.9 automatic triage" | tee -a "$REPORT"
+
+          if grep -q 'quality/driver/driver_name="GLES3"' "$PROJECT/project.godot"; then
+            echo "[OK] GLES3 forced for iOS." | tee -a "$REPORT"
+          else
+            echo "[FIX] GLES3 was missing; forcing it now." | tee -a "$REPORT"
+            cat >> "$PROJECT/override.cfg" <<'EOF'
+          quality/driver/driver_name="GLES3"
+          quality/driver/fallback_to_gles2=false
+          EOF
+          fi
+
+          if grep -q 'vram_compression/import_pvrtc=true' "$PROJECT/project.godot"; then
+            echo "[OK] PVRTC import enabled." | tee -a "$REPORT"
+          else
+            echo "[WARN] PVRTC line missing." | tee -a "$REPORT"
+          fi
+
+          if grep -q 'quality/skinning/force_software_skinning=true' "$PROJECT/override.cfg"; then
+            echo "[OK] Software skinning forced." | tee -a "$REPORT"
+          fi
+
+          if grep -q 'misc/mesh_storage/split_stream=false' "$PROJECT/override.cfg"; then
+            echo "[OK] Split-stream disabled." | tee -a "$REPORT"
+          fi
+
+          echo "[NOTE] GitHub can auto-fix known config/build issues from logs."
+          echo "[NOTE] Pure visual bugs still need a screenshot/video from the iPhone."
+          cat "$REPORT"
 
       - name: Reimport project with iOS PVRTC textures
         shell: bash
@@ -731,7 +824,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.7-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.9-Diagnostics"
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
 
@@ -746,6 +839,10 @@ jobs:
           cp "$WORK/logs/xcodebuild.log" "$DIAG/" 2>/dev/null || true
           cp "$PROJECT/project.godot" "$DIAG/project.godot" 2>/dev/null || true
           cp "$PROJECT/export_presets.cfg" "$DIAG/export_presets.cfg" 2>/dev/null || true
+          cp "$PROJECT/override.cfg" "$DIAG/override.cfg" 2>/dev/null || true
+          cp "$WORK/logs/ios-renderer-settings-v1.9.txt" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/override-v1.9.txt" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/auto-triage-v1.9.txt" "$DIAG/" 2>/dev/null || true
           cp "$WORK/icons/original.png" "$DIAG/original-apk-icon.png" 2>/dev/null || true
 
           {
@@ -786,12 +883,12 @@ jobs:
           exit 0
 
       - name: Upload unsigned IPA
-        if: hashFiles('Cruelty-Squad-iOS-v1.7-unsigned.ipa') != ''
+        if: hashFiles('Cruelty-Squad-iOS-v1.9-unsigned.ipa') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.7-unsigned-IPA
+          name: Cruelty-Squad-iOS-v1.9-unsigned-IPA
           path: |
-            Cruelty-Squad-iOS-v1.7-unsigned.ipa
+            Cruelty-Squad-iOS-v1.9-unsigned.ipa
             Cruelty-Squad-original-icon.png
           compression-level: 0
           if-no-files-found: error
@@ -800,8 +897,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.7-Diagnostics
-          path: Cruelty-Squad-iOS-v1.7-Diagnostics
+          name: Cruelty-Squad-iOS-v1.9-Diagnostics
+          path: Cruelty-Squad-iOS-v1.9-Diagnostics
           compression-level: 0
           if-no-files-found: warn
 
@@ -810,9 +907,9 @@ jobs:
         shell: bash
         run: |
           if [ -f "$IPA" ]; then
-            echo "SUCCESS: Cruelty-Squad-iOS-v1.7-unsigned.ipa was created."
+            echo "SUCCESS: Cruelty-Squad-iOS-v1.9-unsigned.ipa was created."
             exit 0
           fi
 
-          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.7-Diagnostics and send it here."
+          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.9-Diagnostics and send it here."
           exit 1
