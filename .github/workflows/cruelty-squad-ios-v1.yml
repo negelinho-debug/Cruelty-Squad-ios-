@@ -1,4 +1,4 @@
-name: Cruelty Squad iOS - v1.6 Force Xcode Build
+name: Cruelty Squad iOS - v1.7 PVRTC Fix
 
 on:
   workflow_dispatch:
@@ -17,12 +17,12 @@ jobs:
       GDRE_VERSION: "2.6.4"
       APP_NAME: "Cruelty Squad"
       BUNDLE_ID: "com.negel.crueltysquad"
-      WORK: "${{ github.workspace }}/_cruelty_ios_v1_6"
-      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_6/project"
-      APK: "${{ github.workspace }}/_cruelty_ios_v1_6/Cruelty-Squad.apk"
-      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_6/ios-out"
-      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_6/ios-out/CrueltySquad.zip"
-      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.6-unsigned.ipa"
+      WORK: "${{ github.workspace }}/_cruelty_ios_v1_7"
+      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_7/project"
+      APK: "${{ github.workspace }}/_cruelty_ios_v1_7/Cruelty-Squad.apk"
+      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_7/ios-out"
+      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_7/ios-out/CrueltySquad.zip"
+      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.7-unsigned.ipa"
 
     steps:
       - name: Checkout
@@ -317,8 +317,33 @@ jobs:
                   insert = m.end()
                   text = text[:insert] + '\napplication/config/icon="res://ios_icon/original.png"' + text[insert:]
 
+          # Godot 3.x GLES2 iOS export requires PVRTC texture variants.
+          # v1.6 diagnostics failed specifically because this setting was absent.
+          section = re.search(r'(?m)^\[rendering\]\s*$', text)
+          pvrtc_line = 'vram_compression/import_pvrtc=true'
+
+          if re.search(r'(?m)^vram_compression/import_pvrtc=', text):
+              text = re.sub(
+                  r'(?m)^vram_compression/import_pvrtc=.*$',
+                  pvrtc_line,
+                  text
+              )
+          elif section:
+              pos = section.end()
+              text = text[:pos] + '\n' + pvrtc_line + text[pos:]
+          else:
+              text += '\n\n[rendering]\n' + pvrtc_line + '\n'
+
           project.write_text(text)
           PY
+
+          echo "===== iOS TEXTURE COMPRESSION SETTINGS ====="
+          grep -nE 'quality/driver/driver_name|vram_compression/import_(etc|etc2|pvrtc|s3tc)'             "$PROJECT/project.godot"             | tee "$WORK/logs/ios-texture-settings.txt" || true
+
+          # Recovered Android imports only contain Android-friendly texture variants.
+          # Delete the generated cache so Godot regenerates textures with PVRTC.
+          rm -rf "$PROJECT/.import" || true
+          mkdir -p "$PROJECT/.import"
 
           find "$PROJECT" -type f \( -name '*.apk' -o -name '*.aar' \) -delete || true
           find "$PROJECT" -type f -name '*.so' \
@@ -470,13 +495,14 @@ jobs:
 
           mkdir -p "$IOS_OUT"
 
-      - name: Import recovered project
+      - name: Reimport project with iOS PVRTC textures
         shell: bash
-        continue-on-error: true
         run: |
           set +e
 
+          echo "Reimporting recovered project with PVRTC enabled..."
           "$GODOT" \
+            --verbose \
             --path "$PROJECT" \
             --no-window \
             --editor \
@@ -485,12 +511,23 @@ jobs:
 
           RC=${PIPESTATUS[0]}
           echo "GODOT_IMPORT_EXIT_CODE=$RC" | tee -a "$WORK/logs/godot-import.log"
+
+          echo "===== PVRTC IMPORT CHECK ====="
+          find "$PROJECT/.import" -type f 2>/dev/null \
+            | grep -Ei 'pvrtc|\.stex$' \
+            | head -n 200 \
+            | tee "$WORK/logs/pvrtc-import-files.txt" || true
+
+          grep -nEi -A 5 -B 3             'PVRTC|error|failed|failure|unrecognized binary resource|gdnative|godotsteam|qodot'             "$WORK/logs/godot-import.log"             | tail -n 350             | tee "$WORK/logs/godot-import-important.txt" || true
+
+          # Native qodot/godotsteam warnings are known from the Android project
+          # and are not themselves the iOS export blocker. Fail only if Godot
+          # itself returned non-zero.
           exit "$RC"
 
       - name: Export Godot iOS Xcode project
         id: godot_export
         shell: bash
-        continue-on-error: true
         run: |
           set +e
 
@@ -521,15 +558,22 @@ jobs:
           echo "===== LAST 250 EXPORT LOG LINES ====="
           tail -n 250 "$WORK/logs/godot-ios-export.log" || true
 
-          # Keep going. The next step accepts either Godot's normal .zip output
-          # or a directly-created .xcodeproj and will fail only after diagnostics
-          # have been printed and saved.
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::Godot iOS export failed with exit code $RC."
+            grep -nEi -A 10 -B 6               'Cannot export project|Target platform requires|PVRTC|error|failed|failure|gdnative|godotsteam|qodot'               "$WORK/logs/godot-ios-export.log"               | tail -n 450 || true
+            exit "$RC"
+          fi
+
+          if [ ! -f "$IOS_ZIP" ] && ! find "$IOS_OUT" "$WORK" -type d -name '*.xcodeproj' -print -quit 2>/dev/null | grep -q .; then
+            echo "::error::Godot returned success but produced no iOS ZIP/Xcode project."
+            exit 2
+          fi
+
           exit 0
 
       - name: Locate and inspect Godot iOS export
         id: inspect_ios
         shell: bash
-        continue-on-error: true
         run: |
           set +e
 
@@ -582,7 +626,6 @@ jobs:
       - name: Build unsigned iOS app
         id: xcode_build
         shell: bash
-        continue-on-error: true
         run: |
           set +e
 
@@ -647,7 +690,6 @@ jobs:
       - name: Package unsigned IPA
         id: package
         shell: bash
-        continue-on-error: true
         run: |
           set -euo pipefail
 
@@ -689,7 +731,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.6-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.7-Diagnostics"
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
 
@@ -744,12 +786,12 @@ jobs:
           exit 0
 
       - name: Upload unsigned IPA
-        if: hashFiles('Cruelty-Squad-iOS-v1.6-unsigned.ipa') != ''
+        if: hashFiles('Cruelty-Squad-iOS-v1.7-unsigned.ipa') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.6-unsigned-IPA
+          name: Cruelty-Squad-iOS-v1.7-unsigned-IPA
           path: |
-            Cruelty-Squad-iOS-v1.6-unsigned.ipa
+            Cruelty-Squad-iOS-v1.7-unsigned.ipa
             Cruelty-Squad-original-icon.png
           compression-level: 0
           if-no-files-found: error
@@ -758,8 +800,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.6-Diagnostics
-          path: Cruelty-Squad-iOS-v1.6-Diagnostics
+          name: Cruelty-Squad-iOS-v1.7-Diagnostics
+          path: Cruelty-Squad-iOS-v1.7-Diagnostics
           compression-level: 0
           if-no-files-found: warn
 
@@ -768,9 +810,9 @@ jobs:
         shell: bash
         run: |
           if [ -f "$IPA" ]; then
-            echo "SUCCESS: Cruelty-Squad-iOS-v1.6-unsigned.ipa was created."
+            echo "SUCCESS: Cruelty-Squad-iOS-v1.7-unsigned.ipa was created."
             exit 0
           fi
 
-          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.6-Diagnostics and send it here."
+          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.7-Diagnostics and send it here."
           exit 1
