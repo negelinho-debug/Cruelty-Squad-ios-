@@ -1,4 +1,4 @@
-name: Cruelty Squad iOS - v1.5 Xcode Run Fix
+name: Cruelty Squad iOS - v1.6 Force Xcode Build
 
 on:
   workflow_dispatch:
@@ -17,12 +17,12 @@ jobs:
       GDRE_VERSION: "2.6.4"
       APP_NAME: "Cruelty Squad"
       BUNDLE_ID: "com.negel.crueltysquad"
-      WORK: "${{ github.workspace }}/_cruelty_ios_v1_5"
-      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_5/project"
-      APK: "${{ github.workspace }}/_cruelty_ios_v1_5/Cruelty-Squad.apk"
-      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_5/ios-out"
-      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_5/ios-out/CrueltySquad.zip"
-      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.5-unsigned.ipa"
+      WORK: "${{ github.workspace }}/_cruelty_ios_v1_6"
+      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_6/project"
+      APK: "${{ github.workspace }}/_cruelty_ios_v1_6/Cruelty-Squad.apk"
+      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_6/ios-out"
+      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_6/ios-out/CrueltySquad.zip"
+      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.6-unsigned.ipa"
 
     steps:
       - name: Checkout
@@ -579,24 +579,31 @@ jobs:
 
           exit 0
 
-      - name: Show Xcode readiness
-        shell: bash
-        run: |
-          echo "inspect_ios.ready=${{ steps.inspect_ios.outputs.ready }}"
-          echo "inspect_ios.xcodeproj=${{ steps.inspect_ios.outputs.xcodeproj }}"
-
       - name: Build unsigned iOS app
         id: xcode_build
-        if: steps.inspect_ios.outputs.ready == 'true'
         shell: bash
         continue-on-error: true
         run: |
           set +e
 
-          XCPROJ="${{ steps.inspect_ios.outputs.xcodeproj }}"
-          echo "Building Xcode project: $XCPROJ"
+          # Do NOT depend on a GitHub Actions output/if expression here.
+          # The previous step already proved an Xcode project exists.
+          # Rediscover it directly from disk and build it unconditionally.
+          XCPROJ="$(find "$WORK/ios-export" "$IOS_OUT" "$WORK" \
+            -type d -name '*.xcodeproj' -print -quit 2>/dev/null || true)"
 
-          INFO="$(xcodebuild -project "$XCPROJ" -list -json 2>/dev/null)"
+          if [ -z "$XCPROJ" ]; then
+            echo "::error::Xcode project disappeared before build."
+            find "$WORK" -maxdepth 7 -type d -name '*.xcodeproj' -print || true
+            exit 2
+          fi
+
+          echo "Building Xcode project: $XCPROJ"
+          echo "XCPROJ=$XCPROJ" >> "$GITHUB_ENV"
+
+          INFO="$(xcodebuild -project "$XCPROJ" -list -json 2>&1)"
+          printf '%s\n' "$INFO" | tee "$WORK/logs/xcode-project-list-build.json"
+
           SCHEME="$(printf '%s' "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); a=d.get("project",{}).get("schemes",[]); print(a[0] if a else "")' 2>/dev/null)"
           TARGET="$(printf '%s' "$INFO" | python3 -c 'import sys,json; d=json.load(sys.stdin); a=d.get("project",{}).get("targets",[]); print(a[0] if a else "")' 2>/dev/null)"
 
@@ -609,7 +616,7 @@ jobs:
             SELECTOR=(-target "$TARGET")
           else
             echo "::error::Could not determine Xcode scheme or target."
-            exit 2
+            exit 3
           fi
 
           rm -rf "$WORK/products" "$WORK/DerivedData"
@@ -639,12 +646,12 @@ jobs:
 
       - name: Package unsigned IPA
         id: package
-        if: steps.xcode_build.outcome == 'success'
         shell: bash
         continue-on-error: true
         run: |
           set -euo pipefail
 
+          # Package whatever device .app Xcode produced.
           APP="$(find "$WORK/products" "$WORK/DerivedData/Build/Products" \
             -type d -name '*.app' \
             ! -path '*Simulator*' \
@@ -652,6 +659,8 @@ jobs:
 
           if [ -z "$APP" ]; then
             echo "::error::No device .app was produced."
+            echo "Xcode build outcome: ${{ steps.xcode_build.outcome }}"
+            tail -n 250 "$WORK/logs/xcodebuild.log" 2>/dev/null || true
             exit 1
           fi
 
@@ -680,7 +689,7 @@ jobs:
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.5-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.6-Diagnostics"
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
 
@@ -691,6 +700,7 @@ jobs:
           cp "$WORK/logs/project-important-settings.txt" "$DIAG/" 2>/dev/null || true
           cp "$WORK/logs/export-preset.txt" "$DIAG/" 2>/dev/null || true
           cp "$WORK/logs/xcode-project-list.json" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/xcode-project-list-build.json" "$DIAG/" 2>/dev/null || true
           cp "$WORK/logs/xcodebuild.log" "$DIAG/" 2>/dev/null || true
           cp "$PROJECT/project.godot" "$DIAG/project.godot" 2>/dev/null || true
           cp "$PROJECT/export_presets.cfg" "$DIAG/export_presets.cfg" 2>/dev/null || true
@@ -734,12 +744,12 @@ jobs:
           exit 0
 
       - name: Upload unsigned IPA
-        if: hashFiles('Cruelty-Squad-iOS-v1.5-unsigned.ipa') != ''
+        if: hashFiles('Cruelty-Squad-iOS-v1.6-unsigned.ipa') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.5-unsigned-IPA
+          name: Cruelty-Squad-iOS-v1.6-unsigned-IPA
           path: |
-            Cruelty-Squad-iOS-v1.5-unsigned.ipa
+            Cruelty-Squad-iOS-v1.6-unsigned.ipa
             Cruelty-Squad-original-icon.png
           compression-level: 0
           if-no-files-found: error
@@ -748,8 +758,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.5-Diagnostics
-          path: Cruelty-Squad-iOS-v1.5-Diagnostics
+          name: Cruelty-Squad-iOS-v1.6-Diagnostics
+          path: Cruelty-Squad-iOS-v1.6-Diagnostics
           compression-level: 0
           if-no-files-found: warn
 
@@ -758,9 +768,9 @@ jobs:
         shell: bash
         run: |
           if [ -f "$IPA" ]; then
-            echo "SUCCESS: Cruelty-Squad-iOS-v1.5-unsigned.ipa was created."
+            echo "SUCCESS: Cruelty-Squad-iOS-v1.6-unsigned.ipa was created."
             exit 0
           fi
 
-          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.5-Diagnostics and send it here."
+          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.6-Diagnostics and send it here."
           exit 1
