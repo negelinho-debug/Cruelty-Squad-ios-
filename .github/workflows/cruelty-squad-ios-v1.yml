@@ -1,4 +1,4 @@
-name: Cruelty Squad iOS - v1.3 Auto Find APK
+name: Cruelty Squad iOS - v1.4 Export Rescue
 
 on:
   workflow_dispatch:
@@ -17,11 +17,12 @@ jobs:
       GDRE_VERSION: "2.6.4"
       APP_NAME: "Cruelty Squad"
       BUNDLE_ID: "com.negel.crueltysquad"
-      WORK: "${{ github.workspace }}/_cruelty_ios_v1_3"
-      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_3/project"
-      APK: "${{ github.workspace }}/_cruelty_ios_v1_3/Cruelty-Squad.apk"
-      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_3/Cruelty-Squad-iOS.zip"
-      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.3-unsigned.ipa"
+      WORK: "${{ github.workspace }}/_cruelty_ios_v1_4"
+      PROJECT: "${{ github.workspace }}/_cruelty_ios_v1_4/project"
+      APK: "${{ github.workspace }}/_cruelty_ios_v1_4/Cruelty-Squad.apk"
+      IOS_OUT: "${{ github.workspace }}/_cruelty_ios_v1_4/ios-out"
+      IOS_ZIP: "${{ github.workspace }}/_cruelty_ios_v1_4/ios-out/CrueltySquad.zip"
+      IPA: "${{ github.workspace }}/Cruelty-Squad-iOS-v1.4-unsigned.ipa"
 
     steps:
       - name: Checkout
@@ -455,6 +456,20 @@ jobs:
           echo "iOS template candidates:"
           find "$TEMPLATE_DIR" -maxdepth 2 -type f | grep -Ei 'iphone|ios' | head -n 80 || true
 
+      - name: Prepare Xcode for Godot iOS export
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+          xcode-select -p
+          xcodebuild -version
+          xcodebuild -showsdks | tee "$WORK/logs/xcode-sdks.txt"
+          sudo xcodebuild -license accept >/dev/null 2>&1 || true
+          sudo xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
+
+          mkdir -p "$IOS_OUT"
+
       - name: Import recovered project
         shell: bash
         continue-on-error: true
@@ -478,9 +493,17 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          rm -f "$IOS_ZIP"
+
+          rm -rf "$IOS_OUT"
+          mkdir -p "$IOS_OUT"
+
+          echo "===== GODOT iOS EXPORT ====="
+          echo "Godot: $($GODOT --version 2>/dev/null)"
+          echo "Project: $PROJECT"
+          echo "Destination: $IOS_ZIP"
 
           "$GODOT" \
+            --verbose \
             --path "$PROJECT" \
             --no-window \
             --export "iOS" "$IOS_ZIP" \
@@ -489,44 +512,73 @@ jobs:
           RC=${PIPESTATUS[0]}
           echo "GODOT_EXPORT_EXIT_CODE=$RC" | tee -a "$WORK/logs/godot-ios-export.log"
 
-          if [ -f "$IOS_ZIP" ]; then
-            echo "Godot produced iOS ZIP:"
-            ls -lh "$IOS_ZIP"
-          else
-            echo "::warning::Godot did not produce the iOS ZIP."
-          fi
+          echo "===== EXPORT OUTPUTS ====="
+          find "$IOS_OUT" "$WORK" -maxdepth 6 \
+            \( -type f -o -type d \) \
+            \( -name '*.zip' -o -name '*.xcodeproj' -o -name '*.xcworkspace' -o -name '*.pck' \) \
+            -print 2>/dev/null | tee "$WORK/logs/ios-export-files.txt" || true
 
-          exit "$RC"
+          echo "===== LAST 250 EXPORT LOG LINES ====="
+          tail -n 250 "$WORK/logs/godot-ios-export.log" || true
 
-      - name: Inspect Godot export
+          # Keep going. The next step accepts either Godot's normal .zip output
+          # or a directly-created .xcodeproj and will fail only after diagnostics
+          # have been printed and saved.
+          exit 0
+
+      - name: Locate and inspect Godot iOS export
+        id: inspect_ios
         shell: bash
+        continue-on-error: true
         run: |
-          set -euo pipefail
-
-          if [ ! -f "$IOS_ZIP" ]; then
-            echo "::error::No iOS export ZIP exists. Check godot-ios-export.log."
-            exit 1
-          fi
+          set +e
 
           rm -rf "$WORK/ios-export"
           mkdir -p "$WORK/ios-export"
-          ditto -x -k "$IOS_ZIP" "$WORK/ios-export"
 
-          XCPROJ="$(find "$WORK/ios-export" -type d -name '*.xcodeproj' | head -n 1 || true)"
+          ZIP=""
+          if [ -f "$IOS_ZIP" ]; then
+            ZIP="$IOS_ZIP"
+          else
+            ZIP="$(find "$IOS_OUT" "$WORK" -maxdepth 6 -type f -name '*.zip' -print -quit 2>/dev/null || true)"
+          fi
+
+          if [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
+            echo "Found iOS ZIP: $ZIP"
+            ls -lh "$ZIP"
+            ditto -x -k "$ZIP" "$WORK/ios-export" 2>&1 | tee "$WORK/logs/ios-unpack.log"
+          else
+            echo "No iOS ZIP found. Looking for a directly-created Xcode project..."
+          fi
+
+          XCPROJ="$(find "$WORK/ios-export" "$IOS_OUT" "$WORK" \
+            -type d -name '*.xcodeproj' -print -quit 2>/dev/null || true)"
+
           if [ -z "$XCPROJ" ]; then
-            echo "::error::Godot ZIP has no .xcodeproj."
-            find "$WORK/ios-export" -maxdepth 4 -type f | head -n 250
+            echo "::error::Godot produced neither a ZIP nor an Xcode project."
+            echo "===== IMPORTANT GODOT EXPORT ERRORS ====="
+            grep -nEi -A 8 -B 5 \
+              'error|failed|failure|invalid|missing|template|gdnative|native.?script|steam|xcode|iphone|ios' \
+              "$WORK/logs/godot-ios-export.log" 2>/dev/null \
+              | tail -n 350 || true
+            echo "===== FULL LOG TAIL ====="
+            tail -n 350 "$WORK/logs/godot-ios-export.log" || true
+            echo "XCODE_READY=false" >> "$GITHUB_ENV"
             exit 1
           fi
 
           echo "XCPROJ=$XCPROJ" >> "$GITHUB_ENV"
+          echo "XCODE_READY=true" >> "$GITHUB_ENV"
           echo "Xcode project: $XCPROJ"
 
           xcodebuild -project "$XCPROJ" -list -json \
-            | tee "$WORK/logs/xcode-project-list.json" || true
+            2>&1 | tee "$WORK/logs/xcode-project-list.json" || true
+
+          exit 0
 
       - name: Build unsigned iOS app
         id: xcode_build
+        if: env.XCODE_READY == 'true'
         shell: bash
         continue-on-error: true
         run: |
@@ -575,6 +627,7 @@ jobs:
 
       - name: Package unsigned IPA
         id: package
+        if: env.XCODE_READY == 'true'
         shell: bash
         continue-on-error: true
         run: |
@@ -611,14 +664,22 @@ jobs:
       - name: Collect diagnostics
         if: always()
         shell: bash
+        continue-on-error: true
         run: |
           set +e
 
-          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.3-Diagnostics"
+          DIAG="$GITHUB_WORKSPACE/Cruelty-Squad-iOS-v1.4-Diagnostics"
           rm -rf "$DIAG"
           mkdir -p "$DIAG"
 
-          cp -R "$WORK/logs/." "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/godot-ios-export.log" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/godot-import.log" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/gdre-recovery.log" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/apk-summary.txt" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/project-important-settings.txt" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/export-preset.txt" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/xcode-project-list.json" "$DIAG/" 2>/dev/null || true
+          cp "$WORK/logs/xcodebuild.log" "$DIAG/" 2>/dev/null || true
           cp "$PROJECT/project.godot" "$DIAG/project.godot" 2>/dev/null || true
           cp "$PROJECT/export_presets.cfg" "$DIAG/export_presets.cfg" 2>/dev/null || true
           cp "$WORK/icons/original.png" "$DIAG/original-apk-icon.png" 2>/dev/null || true
@@ -630,31 +691,43 @@ jobs:
             echo "=== GODOT ==="
             "$GODOT" --version 2>/dev/null || true
             echo
-            echo "=== PROJECT ==="
-            echo "$PROJECT"
-            echo
-            echo "=== XCODE ==="
+            echo "=== XCODE SELECT ==="
+            xcode-select -p 2>/dev/null || true
             xcodebuild -version 2>/dev/null || true
+            echo
+            echo "=== EXPORT FILES ==="
+            find "$IOS_OUT" "$WORK/ios-export" -maxdepth 6 \
+              \( -name '*.zip' -o -name '*.xcodeproj' -o -name '*.xcworkspace' -o -name '*.pck' \) \
+              -print 2>/dev/null || true
             echo
             echo "=== IPA ==="
             ls -lh "$IPA" 2>/dev/null || true
           } > "$DIAG/summary.txt"
 
-          grep -RniE \
-            'error|failed|failure|parse error|invalid|missing|not found|gdnative|steam|xcodebuild: error|fatal' \
-            "$DIAG" \
-            > "$DIAG/important-errors.txt" \
-            2>/dev/null || true
+          {
+            echo "===== GODOT EXPORT ERROR CONTEXT ====="
+            grep -nEi -A 8 -B 5 \
+              'error|failed|failure|invalid|missing|template|gdnative|native.?script|steam|xcode|iphone|ios' \
+              "$WORK/logs/godot-ios-export.log" 2>/dev/null \
+              | tail -n 450 || true
+            echo
+            echo "===== GODOT EXPORT TAIL ====="
+            tail -n 350 "$WORK/logs/godot-ios-export.log" 2>/dev/null || true
+            echo
+            echo "===== XCODEBUILD TAIL ====="
+            tail -n 350 "$WORK/logs/xcodebuild.log" 2>/dev/null || true
+          } > "$DIAG/important-errors.txt"
 
-          tail -n 500 "$DIAG/important-errors.txt" || true
+          cat "$DIAG/important-errors.txt" || true
+          exit 0
 
       - name: Upload unsigned IPA
-        if: hashFiles('Cruelty-Squad-iOS-v1.3-unsigned.ipa') != ''
+        if: hashFiles('Cruelty-Squad-iOS-v1.4-unsigned.ipa') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.3-unsigned-IPA
+          name: Cruelty-Squad-iOS-v1.4-unsigned-IPA
           path: |
-            Cruelty-Squad-iOS-v1.3-unsigned.ipa
+            Cruelty-Squad-iOS-v1.4-unsigned.ipa
             Cruelty-Squad-original-icon.png
           compression-level: 0
           if-no-files-found: error
@@ -663,9 +736,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Cruelty-Squad-iOS-v1.3-Diagnostics
-          path: Cruelty-Squad-iOS-v1.3-Diagnostics
-          compression-level: 6
+          name: Cruelty-Squad-iOS-v1.4-Diagnostics
+          path: Cruelty-Squad-iOS-v1.4-Diagnostics
+          compression-level: 0
           if-no-files-found: warn
 
       - name: Final result
@@ -673,9 +746,9 @@ jobs:
         shell: bash
         run: |
           if [ -f "$IPA" ]; then
-            echo "SUCCESS: Cruelty-Squad-iOS-v1.3-unsigned.ipa was created."
+            echo "SUCCESS: Cruelty-Squad-iOS-v1.4-unsigned.ipa was created."
             exit 0
           fi
 
-          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.3-Diagnostics and send it here."
+          echo "::error::IPA was not created. Download Cruelty-Squad-iOS-v1.4-Diagnostics and send it here."
           exit 1
